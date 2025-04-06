@@ -76,7 +76,7 @@ def create_tables():
         with DB_ENGINE.connect() as connection:
             with connection.begin(): # Transaction
                 for name, sql in required_tables.items():
-                    logger.info(f"Ensuring table: {name}")
+                    logger.debug(f"Ensuring table: {name}") # Changed to debug for less noise
                     connection.execute(text(sql))
             logger.info("Table creation/verification process completed.")
     except Exception as e:
@@ -99,7 +99,7 @@ def save_data(df, table_name):
         df.to_sql(table_name, DB_ENGINE, if_exists='append', index=False, chunksize=1000)
         logger.info(f"Appended {len(df)} rows to '{table_name}'.")
     except Exception as e:
-        if 'unique constraint failed' in str(e).lower(): logger.warning(f"Constraint violation saving to '{table_name}'. Data likely exists.")
+        if 'unique constraint failed' in str(e).lower(): logger.warning(f"Constraint violation saving to '{table_name}'. Data likely exists (or duplicate in batch).")
         else: logger.error(f"Error saving data to '{table_name}': {e}", exc_info=True)
 
 
@@ -113,7 +113,7 @@ def load_data(query, params=None):
         logger.info(f"Loaded {len(df)} rows using query: {query[:100]}...")
         return df
     except Exception as e:
-        if "no such table" in str(e).lower(): logger.error(f"Query failed because table does not exist: '{query[:100]}...': {e}")
+        if "no such table" in str(e).lower(): logger.warning(f"Query failed because table does not exist: '{query[:100]}...': {e}") # Changed to warning
         else: logger.error(f"Error executing query '{query[:100]}...': {e}", exc_info=True)
         return pd.DataFrame()
 
@@ -135,3 +135,18 @@ def check_data_exists(year, round_number, session_name):
         if "no such table" in str(e).lower(): logger.warning(f"Table 'results' does not exist while checking for {params}. Assuming data does not exist.")
         else: logger.error(f"Error checking data existence for {params}: {e}", exc_info=True)
         return False
+
+# --- ADDED FUNCTION ---
+def table_exists(table_name):
+    """Checks if a table exists in the database."""
+    if not DB_ENGINE: logger.error("DB engine invalid. Cannot check table existence."); return False
+    logger.debug(f"Checking if table '{table_name}' exists.")
+    try:
+        inspector = inspect(DB_ENGINE)
+        exists = inspector.has_table(table_name)
+        logger.debug(f"Table '{table_name}' exists: {exists}")
+        return exists
+    except Exception as e:
+        logger.error(f"Error checking table existence for '{table_name}': {e}", exc_info=True)
+        return False
+# --- END ADDED FUNCTION ---
