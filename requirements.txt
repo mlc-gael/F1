@@ -1,0 +1,10 @@
+fastf1
+pandas
+numpy
+scikit-learn
+joblib
+xgboost
+lightgbm
+sqlalchemy
+tqdm
+openpyxl

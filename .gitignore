@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Databases
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+f1_data.sqlite*  # Explicitly ignore the default DB name
+
+# FastF1 Cache (Update if you change CACHE_DIR in config.py)
+fastf1_cache/
+fastf1_cache/**/*
+
+# Model files
+models/
+models/*.joblib
+models/*.pkl
+
+# Logs
+*.log
+f1_predictor.log* # Explicitly ignore default log name
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
