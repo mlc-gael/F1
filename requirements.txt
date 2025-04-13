@@ -10,3 +10,4 @@ tqdm
 openpyxl
 requests
 scipy
+pyarrow

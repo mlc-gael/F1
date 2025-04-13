@@ -5,17 +5,21 @@ import numpy as np
 import warnings
 import os
 import datetime
-import json # Added import
+import json
+try:
+    import pyarrow
+except ImportError:
+    print("Warning: 'pyarrow' not installed. Saving/loading features cache will fail if using Feather format.")
 
 # Import project modules
 import config
 import database
 import utils
 import model as model_loader
-import feature_engineering # Keep this import
 
 # Setup logger
-utils.setup_logging()
+# Assuming utils.setup_logging() is called elsewhere (e.g., main.py)
+# utils.setup_logging()
 logger = utils.get_logger(__name__)
 
 # Suppress warnings
@@ -25,419 +29,453 @@ pd.options.mode.chained_assignment = None
 
 
 def get_target_race_info(target_year, target_race_identifier):
-    """Finds the round number, event name, and location for the target race."""
-    # (Keep this function as is)
+    """Finds the round number, event name, location, and date for the target race."""
     logger.info(f"Looking up info for target race: Year {target_year}, Identifier '{target_race_identifier}'")
-    query = "SELECT RoundNumber, EventName, Location FROM events WHERE Year = :year"
+    query = "SELECT RoundNumber, EventName, Location, EventDate FROM events WHERE Year = :year"
     params = {"year": target_year}
     schedule_df = database.load_data(query, params=params)
-    if schedule_df is None or schedule_df.empty: logger.error(f"No schedule found for year {target_year}."); return None, None, None
+    if schedule_df is None or schedule_df.empty:
+        logger.error(f"No schedule found for year {target_year}.")
+        return None, None, None, None
 
-    target_round, target_location, target_name = None, None, None
-    try: # Match by RoundNumber first
+    target_round, target_location, target_name, target_date_str = None, None, None, None
+    try:
         target_round_input = int(target_race_identifier)
         race_match = schedule_df[schedule_df['RoundNumber'] == target_round_input]
         if not race_match.empty:
-            target_round, target_location, target_name = target_round_input, race_match.iloc[0]['Location'], race_match.iloc[0]['EventName']
-            logger.info(f"Found target race by RoundNumber: R{target_round} - {target_name} ({target_location})")
-            return target_round, target_location, target_name
+            target_round = target_round_input
+            target_location = race_match.iloc[0]['Location']
+            target_name = race_match.iloc[0]['EventName']
+            target_date_str = race_match.iloc[0]['EventDate']
+            logger.info(f"Found target race by RoundNumber: R{target_round} - {target_name} ({target_location}) Date: {target_date_str}")
     except ValueError: logger.debug("Attempting name match..."); pass
-    except KeyError as e: logger.error(f"Schedule columns error: {e}"); return None, None, None
+    except KeyError as e: logger.error(f"Schedule columns error: {e}"); return None, None, None, None
 
-    identifier_lower = str(target_race_identifier).lower()
-    try: # Match by Name/Location
-        race_match_exact = schedule_df[schedule_df['EventName'].str.lower() == identifier_lower]
-        if race_match_exact.empty:
-             race_match_exact = schedule_df[schedule_df['Location'].str.lower() == identifier_lower]
+    if target_round is None:
+        identifier_lower = str(target_race_identifier).lower()
+        try:
+            # Prioritize exact matches before contains
+            race_match = schedule_df[schedule_df['EventName'].str.lower() == identifier_lower]
+            if race_match.empty: race_match = schedule_df[schedule_df['Location'].str.lower() == identifier_lower]
+            # Fallback to contains if no exact match
+            if race_match.empty: race_match = schedule_df[schedule_df['EventName'].str.lower().str.contains(identifier_lower, na=False)]
+            if race_match.empty: race_match = schedule_df[schedule_df['Location'].str.lower().str.contains(identifier_lower, na=False)]
 
-        if not race_match_exact.empty:
-             race_match = race_match_exact
-        else:
-             race_match_contains = schedule_df[schedule_df['EventName'].str.lower().str.contains(identifier_lower, na=False)]
-             if race_match_contains.empty:
-                  race_match_contains = schedule_df[schedule_df['Location'].str.lower().str.contains(identifier_lower, na=False)]
-             race_match = race_match_contains
+            if not race_match.empty:
+                if len(race_match) > 1: logger.warning(f"Multiple matches for '{target_race_identifier}'. Using first: {race_match.iloc[0]['EventName']}")
+                target_round = int(race_match.iloc[0]['RoundNumber'])
+                target_location = race_match.iloc[0]['Location']
+                target_name = race_match.iloc[0]['EventName']
+                target_date_str = race_match.iloc[0]['EventDate']
+                logger.info(f"Found target race by Name/Location: R{target_round} - {target_name} ({target_location}) Date: {target_date_str}")
+            else:
+                logger.error(f"Could not find race matching '{target_race_identifier}' for {target_year}.")
+                return None, None, None, None
+        except KeyError as e: logger.error(f"Schedule columns error: {e}"); return None, None, None, None
+        except Exception as e: logger.error(f"Race lookup error: {e}", exc_info=True); return None, None, None, None
 
-        if not race_match.empty:
-            if len(race_match) > 1: logger.warning(f"Multiple matches for '{target_race_identifier}'. Using first: {race_match.iloc[0]['EventName']}")
-            target_round, target_location, target_name = int(race_match.iloc[0]['RoundNumber']), race_match.iloc[0]['Location'], race_match.iloc[0]['EventName']
-            logger.info(f"Found target race by Name/Location: R{target_round} - {target_name} ({target_location})")
-            return target_round, target_location, target_name
-        else: logger.error(f"Could not find race matching '{target_race_identifier}' for {target_year}."); return None, None, None
-    except KeyError as e: logger.error(f"Schedule columns error: {e}"); return None, None, None
-    except Exception as e: logger.error(f"Race lookup error: {e}", exc_info=True); return None, None, None
+    target_date = None
+    if target_date_str:
+        try:
+            # Handle potential 'NaT' strings explicitly before parsing
+            if isinstance(target_date_str, str) and target_date_str.lower() != 'nat':
+                 target_date = pd.to_datetime(target_date_str).date()
+                 logger.info(f"Parsed target date: {target_date}")
+            elif pd.isna(target_date_str):
+                 logger.warning("EventDate string is NaT/NaN. Cannot parse.")
+            else:
+                 logger.warning(f"EventDate string '{target_date_str}' is not standard NaT but failed other checks.")
+
+        except Exception as e:
+             logger.warning(f"Could not parse EventDate string '{target_date_str}': {e}. Forecast will use defaults.")
+
+    return target_round, target_location, target_name, target_date
 
 
 def get_historical_weather_averages(track_location):
-    """Gets historical average weather for a specific track from the DB."""
-    # (Keep this function as is)
     logger.info(f"Querying historical weather averages for track: {track_location}")
+    # Assume the original query was correct, otherwise adjust here
     query = """
         SELECT
-            AVG(w.AirTemp) as AvgTemp,
-            AVG(CASE WHEN w.Rainfall = 1 THEN 1.0 ELSE 0.0 END) as AvgRainProb, -- Avg probability
-            AVG(w.WindSpeed) as AvgWindSpeed
-        FROM weather w
-        JOIN events e ON w.Year = e.Year AND w.RoundNumber = e.RoundNumber
-        WHERE e.Location = :location AND w.SessionName = 'R' -- Use Race session weather
+            AVG(AvgAirTemp) as AvgTemp,
+            AVG(AvgWindSpeed) as AvgWindSpeed,
+            SUM(CASE WHEN MaxRainfall > 0 THEN 1.0 ELSE 0.0 END) * 1.0 / COUNT(*) as AvgRainProb
+        FROM (
+            SELECT
+                e.Location,
+                w.Year,
+                w.RoundNumber,
+                AVG(w.AirTemp) as AvgAirTemp,
+                AVG(w.WindSpeed) as AvgWindSpeed,
+                MAX(w.Rainfall) as MaxRainfall
+            FROM weather w
+            JOIN events e ON w.Year = e.Year AND w.RoundNumber = e.RoundNumber
+            WHERE w.SessionName = 'R' AND e.Location = :location
+            GROUP BY e.Location, w.Year, w.RoundNumber
+        ) as RaceWeatherStats
+        GROUP BY Location;
     """
     params = {"location": track_location}
     hist_weather = database.load_data(query, params=params)
-
     if hist_weather is not None and not hist_weather.empty and not hist_weather.isnull().all().all():
          averages = hist_weather.iloc[0].to_dict()
+         # Ensure keys match expected forecast column names
          mapped_averages = {
-             'ForecastTemp': averages.get('AvgTemp'),
-             'ForecastRainProb': averages.get('AvgRainProb'),
-             'ForecastWindSpeed': averages.get('AvgWindSpeed')
-         }
+              'ForecastTemp': averages.get('AvgTemp'),
+              'ForecastRainProb': averages.get('AvgRainProb'), # Already calculated as avg probability
+              'ForecastWindSpeed': averages.get('AvgWindSpeed')
+              }
          final_averages = {k: v for k, v in mapped_averages.items() if v is not None and not pd.isna(v)}
-         if final_averages:
-             logger.info(f"Found historical weather averages: {final_averages}")
-             return final_averages
-         else:
-              logger.warning("Historical weather query succeeded but returned no valid averages.")
-              return None
-    else:
-        logger.warning(f"Could not find historical weather averages for track: {track_location}")
-        return None
+         if final_averages: logger.info(f"Found historical weather averages: {final_averages}"); return final_averages
+         else: logger.warning("Historical weather query succeeded but returned no valid averages.")
+    else: logger.warning(f"Could not find historical weather averages for track: {track_location}")
+    return None
 
 
-def prepare_prediction_data(target_year, target_round, target_location, feature_cols):
+def get_feature_fill_value(column_name):
+    """Gets the appropriate fill value for a feature column from config."""
+    # Use the actual 'default' value from the config dictionary
+    fill_val = config.FEATURE_FILL_DEFAULTS.get('default', -999.0) # Use -999.0 or whatever is in config
+    # Check for specific patterns
+    for pattern, value in config.FEATURE_FILL_DEFAULTS.items():
+        if pattern != 'default' and pattern.lower() in column_name.lower():
+            fill_val = value
+            break # Use first matching pattern
+    # Ensure float type if appropriate for the column based on config value type
+    if isinstance(fill_val, (int, float)):
+        return float(fill_val)
+    return fill_val
+
+
+def prepare_prediction_data(target_year, target_round, target_location, target_date, feature_cols, feature_dtypes):
     """
-    Prepares the feature set (X_predict).
-    Handles missing qualifying data and missing weather forecasts.
+    Prepares the feature set (X_predict) using cached features and applying necessary updates.
+    Handles missing qualifying data, weather forecasts, and ensures dtype consistency.
+    Returns:
+        tuple: (X_predict, final_info_df, used_grid_fallback_flag)
+               Returns (None, None, False) on critical failure.
     """
-    # (Keep Sections 1-4 as they were in the previous corrected version)
     logger.info(f"Preparing prediction data for {target_year} R{target_round} ({target_location}).")
-    use_quali_fallback = False
+    used_grid_fallback = False # --- CHANGE: Flag to track fallback usage ---
+    predict_info_df = pd.DataFrame() # Holds driver, team, grid for the target race
 
-    # --- 1. Get Qualifying Data (Optional) ---
+    # --- 1. Load Cached Engineered Features ---
+    logger.info(f"Attempting to load cached features from: {config.FEATURES_CACHE_PATH}")
+    if os.path.exists(config.FEATURES_CACHE_PATH):
+        try:
+            df_features_all = pd.read_feather(config.FEATURES_CACHE_PATH)
+            logger.info(f"Loaded {len(df_features_all)} rows of cached features.")
+            # Ensure categorical columns are set correctly after loading
+            if 'TrackType' in df_features_all.columns and 'TrackType' in feature_dtypes and feature_dtypes['TrackType'] == 'category':
+                logger.debug("Casting loaded TrackType to category.")
+                df_features_all['TrackType'] = df_features_all['TrackType'].astype('category')
+        except Exception as e:
+            logger.error(f"Failed to load cached features: {e}. Prediction cannot proceed without historical data.", exc_info=True)
+            return None, None, False
+    else:
+        logger.error(f"Cached features file not found at {config.FEATURES_CACHE_PATH}. Run training first to generate it. Prediction cannot proceed.")
+        return None, None, False
+
+
+    # --- 2. Get Qualifying Data (for GridPosition and Driver List) ---
     logger.info(f"Attempting to fetch Qualifying data for {target_year} R{target_round}")
-    quali_query = "SELECT Abbreviation, TeamName, Position as QualiPositionRaw FROM results WHERE Year = :year AND RoundNumber = :round AND SessionName = 'Q'"
+    quali_query = "SELECT Abbreviation, TeamName, Position as QualiPositionRaw, GridPosition as OfficialGrid FROM results WHERE Year = :year AND RoundNumber = :round AND SessionName = 'Q'"
     quali_params = {"year": target_year, "round": target_round}
     df_quali_target = database.load_data(quali_query, params=quali_params)
-    predict_info_df = pd.DataFrame()
 
-    if df_quali_target.empty:
-        logger.warning(f"No Qualifying data found for target race {target_year} R{target_round}. GridPosition will use fallbacks.")
-        use_quali_fallback = True
+    if df_quali_target is None or df_quali_target.empty: # Check for None from DB load failure too
+        logger.warning(f"No Qualifying session data found in DB for target race {target_year} R{target_round}. Triggering fallback.")
+        used_grid_fallback = True # --- CHANGE: Set fallback flag ---
     else:
-        df_quali_target['QualiPositionRaw'] = utils.safe_to_numeric(df_quali_target['QualiPositionRaw'], fallback=np.nan)
-        min_quali_indices = df_quali_target.groupby('Abbreviation')['QualiPositionRaw'].idxmin().dropna()
-        if min_quali_indices.empty:
-            logger.warning(f"Quali data found, but no valid times set. GridPosition will use fallbacks.")
-            use_quali_fallback = True
-            predict_info_df = df_quali_target[['Abbreviation', 'TeamName']].drop_duplicates().copy()
-            predict_info_df['GridPosition'] = np.nan
-        else:
-            df_quali_final = df_quali_target.loc[min_quali_indices].copy()
-            df_quali_final.rename(columns={'QualiPositionRaw': 'GridPosition'}, inplace=True)
-            all_drivers_in_quali = df_quali_target['Abbreviation'].unique()
-            drivers_with_valid_time = df_quali_final['Abbreviation'].unique()
-            drivers_without_valid_time = np.setdiff1d(all_drivers_in_quali, drivers_with_valid_time)
-            if len(drivers_without_valid_time) > 0:
-                logger.warning(f"Drivers with no valid quali time found: {drivers_without_valid_time}. Assigning worst grid position.")
-                missing_drivers_df = pd.DataFrame({
-                    'Abbreviation': drivers_without_valid_time,
-                    'TeamName': [df_quali_target[df_quali_target['Abbreviation'] == abbr]['TeamName'].iloc[0] if not df_quali_target[df_quali_target['Abbreviation'] == abbr].empty else 'Unknown' for abbr in drivers_without_valid_time],
-                    'GridPosition': config.WORST_EXPECTED_POS
-                })
-                df_quali_final = pd.concat([df_quali_final, missing_drivers_df], ignore_index=True)
-            df_quali_final['GridPosition'] = utils.safe_to_numeric(df_quali_final['GridPosition'], fallback=config.WORST_EXPECTED_POS).astype(int)
-            logger.info(f"Processed Qualifying data. Grid positions determined for {len(df_quali_final)} drivers.")
-            predict_info_df = df_quali_final[['Abbreviation', 'TeamName', 'GridPosition']].copy()
+        # Get unique participants from this session
+        predict_info_df = df_quali_target[['Abbreviation', 'TeamName']].drop_duplicates().copy()
+        predict_info_df['Abbreviation'] = predict_info_df['Abbreviation'].astype(str)
+        predict_info_df['TeamName'] = predict_info_df['TeamName'].astype(str)
+        logger.info(f"Identified {len(predict_info_df)} participants from Qualifying session.")
 
-    # --- 2. Get Latest Historical Features ---
-    logger.info("Generating historical features to find latest values...")
-    df_features_all, _, _ = feature_engineering.create_features()
-    if df_features_all is None or df_features_all.empty:
-        logger.error("CRITICAL: Feature generation for historical data failed. Cannot proceed.")
-        return None, None
-    df_features_all.sort_values(by=['Year', 'RoundNumber'], inplace=True)
+        # Try to get official grid first
+        df_quali_target['OfficialGrid'] = utils.safe_to_numeric(df_quali_target.get('OfficialGrid'), fallback=np.nan)
+        grid_map = df_quali_target.dropna(subset=['OfficialGrid']).drop_duplicates(subset=['Abbreviation'], keep='first').set_index('Abbreviation')['OfficialGrid']
+
+        if not grid_map.empty:
+            logger.info("Using official GridPosition from Qualifying results.")
+            predict_info_df['GridPosition'] = predict_info_df['Abbreviation'].map(grid_map)
+        else:
+            logger.warning("Official GridPosition not found in Quali data. Using Quali Position Rank as fallback.")
+            df_quali_target['QualiPositionRaw'] = utils.safe_to_numeric(df_quali_target['QualiPositionRaw'], fallback=np.nan)
+            min_quali_pos = df_quali_target.groupby('Abbreviation')['QualiPositionRaw'].min()
+            df_quali_target['MinQualiPos'] = df_quali_target['Abbreviation'].map(min_quali_pos)
+            df_quali_target['QualiRank'] = df_quali_target['MinQualiPos'].rank(method='min', na_option='bottom')
+            rank_map = df_quali_target.dropna(subset=['QualiRank']).drop_duplicates(subset=['Abbreviation'], keep='first').set_index('Abbreviation')['QualiRank']
+            predict_info_df['GridPosition'] = predict_info_df['Abbreviation'].map(rank_map)
+
+        missing_grid_count = predict_info_df['GridPosition'].isnull().sum()
+        if missing_grid_count > 0:
+             logger.warning(f"{missing_grid_count} drivers have missing GridPosition after primary Quali methods. Triggering fallback.")
+             used_grid_fallback = True # --- CHANGE: Set fallback flag ---
+        else:
+             logger.info("Successfully assigned GridPosition using primary Quali methods.")
+
+
+    # --- 3. Get Latest Historical Features for Participating Drivers ---
+    logger.info("Extracting latest historical features...")
     previous_race_entries = df_features_all[
         (df_features_all['Year'] < target_year) |
         ((df_features_all['Year'] == target_year) & (df_features_all['RoundNumber'] < target_round))
-    ]
-    if previous_race_entries.empty:
-        logger.warning(f"No historical race data found prior to target {target_year} R{target_round}. Using defaults/NaNs for historical features.")
-        latest_historical_features = pd.DataFrame(columns=['Abbreviation'] + feature_cols)
-        if use_quali_fallback:
-             logger.error("CRITICAL: No qualifying data AND no previous race data found. Cannot determine drivers for prediction.")
-             return None, None
-    else:
-        last_hist_year = previous_race_entries['Year'].iloc[-1]
-        last_hist_round = previous_race_entries['RoundNumber'].iloc[-1]
-        logger.info(f"Latest historical data point found: {last_hist_year} R{last_hist_round}")
-        latest_historical_features = df_features_all[
-            (df_features_all['Year'] == last_hist_year) &
-            (df_features_all['RoundNumber'] == last_hist_round)
-        ].copy()
-        if use_quali_fallback:
-             logger.info("Using drivers from last historical race as participants.")
-             predict_info_df = latest_historical_features[['Abbreviation', 'TeamName']].drop_duplicates().copy()
-             predict_info_df['GridPosition'] = np.nan
+    ].copy()
 
-    # --- 3. Merge Historical Features ---
-    logger.info("Merging latest historical features...")
-    cols_to_merge = ['Abbreviation'] + [col for col in feature_cols if col != 'GridPosition' and col in latest_historical_features.columns]
-    features_to_merge = latest_historical_features[cols_to_merge].drop_duplicates(subset=['Abbreviation'], keep='last')
+    if previous_race_entries.empty:
+        logger.warning(f"No historical race data found prior to target {target_year} R{target_round}. Using defaults for historical features.")
+        cols_to_extract = ['Abbreviation'] + [f for f in feature_cols if f != 'GridPosition']
+        latest_historical_features = pd.DataFrame(columns=cols_to_extract)
+        if used_grid_fallback: # If Quali ALSO failed
+            logger.error("CRITICAL: No qualifying data AND no previous race data found. Cannot determine drivers for prediction.")
+            return None, None, False
+    else:
+        latest_historical_features = previous_race_entries.loc[previous_race_entries.groupby('Abbreviation').tail(1).index].copy()
+        cols_to_merge = ['Abbreviation'] + [col for col in feature_cols if col != 'GridPosition' and col in latest_historical_features.columns]
+        latest_historical_features = latest_historical_features[cols_to_merge]
+
+        if used_grid_fallback: # If Quali failed, use drivers from history
+             logger.info("Using drivers from last historical race as participants (Quali fallback).")
+             predict_info_df = latest_historical_features[['Abbreviation']].copy()
+             team_map = previous_race_entries.loc[previous_race_entries.groupby('Abbreviation').tail(1).index].set_index('Abbreviation')['TeamName']
+             predict_info_df['TeamName'] = predict_info_df['Abbreviation'].map(team_map).fillna('Unknown')
+             predict_info_df['GridPosition'] = np.nan # Grid needs fallback method applied below
+             logger.info(f"Identified {len(predict_info_df)} participants from last race (Quali fallback).")
+
+
+    # --- 4. Merge Historical Features with Target Race Info ---
     if predict_info_df.empty:
          logger.error("CRITICAL: No drivers identified for prediction.")
-         return None, None
-    predict_df = pd.merge(predict_info_df, features_to_merge, on='Abbreviation', how='left')
-    logger.info(f"Merged features. Shape: {predict_df.shape}. Columns: {predict_df.columns.tolist()}")
+         return None, None, False
 
-    # --- 4. Handle Missing Data ---
-    if use_quali_fallback:
-        logger.warning("Applying fallback logic for GridPosition.")
-        if 'RollingAvgPosLastN' in predict_df.columns:
-             predict_df['GridPosition'] = predict_df['GridPosition'].fillna(predict_df['RollingAvgPosLastN'].round()).fillna(11.0)
-             logger.info("Used RollingAvgPosLastN for GridPosition fallback.")
+    logger.info(f"Merging historical features for {len(predict_info_df)} drivers...")
+    predict_info_df['Abbreviation'] = predict_info_df['Abbreviation'].astype(str)
+    latest_historical_features['Abbreviation'] = latest_historical_features['Abbreviation'].astype(str)
+    predict_df = pd.merge(predict_info_df, latest_historical_features, on='Abbreviation', how='left')
+    logger.info(f"Merged features. Shape: {predict_df.shape}.")
+
+
+    # --- 5. Apply Grid Position Fallback (if Quali data was missing/incomplete) ---
+    # Apply fallback if the flag is set OR if there are still NaNs after primary attempt
+    if used_grid_fallback or predict_df['GridPosition'].isnull().any():
+        missing_grid_mask = predict_df['GridPosition'].isnull()
+        num_missing = missing_grid_mask.sum()
+        if num_missing > 0: # Apply only if there are actual NaNs to fill
+            logger.warning(f"Applying GridPosition fallback for {num_missing} drivers using method: '{config.GRID_POS_FALLBACK_METHOD}'.")
+            method = config.GRID_POS_FALLBACK_METHOD
+            fallback_value = config.WORST_EXPECTED_POS # Default
+
+            if method == 'RollingAvg' and 'RollingAvgPosLastN' in predict_df.columns:
+                logger.info("Using RollingAvgPosLastN for GridPosition fallback.")
+                fallback_values = predict_df.loc[missing_grid_mask, 'RollingAvgPosLastN'].round()
+                predict_df.loc[missing_grid_mask, 'GridPosition'] = fallback_values
+            elif method == 'MidPack':
+                logger.info(f"Using MidPack ({config.GRID_POS_FALLBACK_MIDPACK_VALUE}) for GridPosition fallback.")
+                fallback_value = config.GRID_POS_FALLBACK_MIDPACK_VALUE
+                predict_df.loc[missing_grid_mask, 'GridPosition'] = fallback_value
+            else: # 'Worst' or unspecified
+                logger.info(f"Using WorstExpected ({config.WORST_EXPECTED_POS}) for GridPosition fallback.")
+                predict_df.loc[missing_grid_mask, 'GridPosition'] = fallback_value
+
+            # Final catch-all fill if the chosen fallback method still resulted in NaNs
+            predict_df['GridPosition'].fillna(config.WORST_EXPECTED_POS, inplace=True)
+            used_grid_fallback = True # Ensure flag is true if any fallback was applied here
         else:
-             logger.warning("RollingAvgPosLastN not available, using default mid-pack (11) for GridPosition.")
-             predict_df['GridPosition'].fillna(11.0, inplace=True)
-        predict_df['GridPosition'] = predict_df['GridPosition'].astype(int)
-    missing_feature_mask = predict_df[[col for col in feature_cols if col != 'GridPosition']].isnull()
-    cols_with_miss = missing_feature_mask.any()
-    missing_cols = cols_with_miss[cols_with_miss].index.tolist()
-    if missing_cols:
-        logger.warning(f"Missing historical feature data detected for some drivers in columns: {missing_cols}. Filling with defaults.")
-        for col in missing_cols:
-            if col in predict_df.columns:
-                fill_val = config.FILL_NA_VALUE
-                if 'Pts' in col or 'Points' in col: fill_val = 0.0
-                elif 'Pos' in col or 'Position' in col: fill_val = float(config.WORST_EXPECTED_POS)
-                predict_df[col].fillna(fill_val, inplace=True)
-            else: logger.error(f"Logic error: Column '{col}' expected but not found during NaN fill.")
+             logger.info("Grid fallback was triggered, but no NaNs needed filling.")
 
-    # --- 5. Add Weather Forecast Features (with Fallback) ---
-    logger.info("Attempting to get weather forecast...")
+    # --- Steps 6, 7, 8, 9 remain the same as the previous corrected version ---
+    # ... (Assume steps 6-9 are correct as per the last revision) ...
+    # --- 6. Handle Missing Historical Features ---
+    logger.info("Handling missing historical features...")
+    hist_feature_cols = [
+        col for col in feature_cols
+        if col != 'GridPosition' and not col.startswith('Forecast') and not col.startswith('Track_') and col != 'TrackType'
+    ]
+    missing_hist_data_mask = predict_df[hist_feature_cols].isnull()
+    if missing_hist_data_mask.values.any():
+        cols_with_miss = predict_df[hist_feature_cols].columns[missing_hist_data_mask.any()].tolist()
+        logger.warning(f"Missing historical feature data detected in: {cols_with_miss}. Filling with defaults.")
+        for col in cols_with_miss:
+            if col in predict_df.columns:
+                fill_val = get_feature_fill_value(col)
+                logger.debug(f"Filling NaN in '{col}' with {fill_val}")
+                predict_df[col].fillna(fill_val, inplace=True)
+            else:
+                 logger.error(f"Logic error: Historical column '{col}' expected but not found in predict_df during NaN fill.")
+
+    # --- 7. Add Weather Forecast Features ---
+    logger.info("Adding weather forecast features...")
     expected_forecast_cols = ['ForecastTemp', 'ForecastRainProb', 'ForecastWindSpeed']
     forecast_features = {}
-    target_event_date = None
     coords = utils.TRACK_COORDINATES.get(target_location)
-    if coords:
+    if coords and not any(pd.isna(c) for c in coords):
         latitude, longitude = coords
-        forecast_data = utils.get_weather_forecast(latitude, longitude, target_date=target_event_date)
-        if forecast_data:
-            forecast_features = forecast_data
-            logger.info(f"Obtained live forecast data: {forecast_features}")
-        else:
-            logger.warning("Failed to get live weather forecast. Attempting historical fallback.")
-            hist_weather_avg = get_historical_weather_averages(target_location)
-            if hist_weather_avg:
-                 logger.warning(f"Using historical weather averages for fallback: {hist_weather_avg}")
-                 forecast_features = hist_weather_avg
-            else:
-                 logger.error("Historical weather fallback failed. Using generic defaults.")
-                 forecast_features = {'ForecastTemp': 20.0, 'ForecastRainProb': 0.1, 'ForecastWindSpeed': 10.0}
-    else:
-        logger.warning(f"Coordinates not found for track: {target_location}. Using generic weather defaults.")
-        forecast_features = { 'ForecastTemp': 20.0, 'ForecastRainProb': 0.1, 'ForecastWindSpeed': 10.0 }
+        live_forecast = utils.get_weather_forecast(latitude, longitude, target_date=target_date)
+        if live_forecast: forecast_features = live_forecast; logger.info(f"Obtained live forecast data: {forecast_features}")
+        else: logger.warning("Failed to get live weather forecast. Attempting historical fallback.")
+    else: logger.warning(f"Coordinates not found or invalid for track: {target_location}. Attempting historical fallback for weather.")
+    if not forecast_features:
+        hist_weather_avg = get_historical_weather_averages(target_location)
+        if hist_weather_avg: forecast_features = hist_weather_avg; logger.info(f"Using historical weather averages: {forecast_features}")
+        else: logger.warning("Historical weather fallback failed. Using generic defaults.")
     for fc_col in expected_forecast_cols:
         value = forecast_features.get(fc_col)
-        if value is None or pd.isna(value):
-             default_val = config.FILL_NA_VALUE
-             if fc_col == 'ForecastTemp': default_val = 20.0
-             elif fc_col == 'ForecastRainProb': default_val = 0.1
-             elif fc_col == 'ForecastWindSpeed': default_val = 10.0
-             logger.warning(f"Assigning default value {default_val} for missing weather feature '{fc_col}'")
-             predict_df.loc[:, fc_col] = default_val
-        else:
-             predict_df.loc[:, fc_col] = value
+        if value is None or pd.isna(value): fill_val = get_feature_fill_value(fc_col); logger.warning(f"Assigning default value {fill_val} for missing weather feature '{fc_col}'"); predict_df[fc_col] = fill_val
+        else: predict_df[fc_col] = value
         predict_df[fc_col] = predict_df[fc_col].astype(float)
 
-    # --- 6. Handle Categorical Track Features ---
-    # --- FIX START: Refined OHE Handling ---
+    # --- 8. Add Track Characteristics ---
+    logger.info("Adding track characteristic features...")
     try:
         track_type = config.TRACK_CHARACTERISTICS.get(target_location, 'Unknown')
-        logger.info(f"Mapping target location '{target_location}' to TrackType: '{track_type}'")
-        is_categorical_model = config.MODEL_TYPE.lower() in ['lightgbm']
-        # Get list of expected OHE columns from feature_cols
+        logger.info(f"TrackType for {target_location}: '{track_type}'")
+        is_categorical_model = feature_dtypes.get('TrackType') == 'category'
         expected_ohe_cols = [f for f in feature_cols if f.startswith('Track_')]
-        is_ohe_model = bool(expected_ohe_cols) # True if any Track_ cols are expected
-
-        if is_categorical_model and 'TrackType' in feature_cols:
-            predict_df['TrackType'] = track_type
-            predict_df['TrackType'] = predict_df['TrackType'].astype('category')
-            logger.info("Added TrackType as category for LightGBM.")
-            # Ensure 'TrackType' is the only track-related feature expected
-            if any(f.startswith('Track_') for f in feature_cols):
-                logger.warning("Model expects both 'TrackType' and OHE 'Track_*' columns? Check feature_cols.")
+        is_ohe_model = bool(expected_ohe_cols)
+        if is_categorical_model:
+             logger.info("Handling TrackType as categorical feature.")
+             if 'TrackType' not in predict_df.columns: predict_df['TrackType'] = 'Unknown'
+             if not pd.api.types.is_categorical_dtype(predict_df['TrackType']): predict_df['TrackType'] = predict_df['TrackType'].astype('category')
+             if track_type not in predict_df['TrackType'].cat.categories: logger.warning(f"Track type '{track_type}' not in known categories during prediction. Adding it."); predict_df['TrackType'] = predict_df['TrackType'].cat.add_categories([track_type])
+             predict_df['TrackType'] = predict_df['TrackType'].fillna('Unknown'); predict_df.loc[:, 'TrackType'] = track_type; predict_df['TrackType'] = predict_df['TrackType'].astype('category')
+             logger.info("Set TrackType as category.")
         elif is_ohe_model:
-            # Add all expected OHE columns first, initialized to 0
-            logger.debug(f"Initializing expected OHE columns: {expected_ohe_cols}")
-            for ohe_col in expected_ohe_cols:
-                if ohe_col not in predict_df.columns:
-                     predict_df[ohe_col] = 0
-                else:
-                     # If it somehow already exists (e.g., from historical merge), ensure it's numeric 0/1
-                     predict_df[ohe_col] = utils.safe_to_numeric(predict_df[ohe_col], fallback=0).astype(int)
+             logger.info("Handling TrackType using One-Hot Encoding.")
+             for ohe_col in expected_ohe_cols:
+                 if ohe_col not in predict_df.columns: predict_df[ohe_col] = 0
+                 else: predict_df[ohe_col] = pd.to_numeric(predict_df[ohe_col], errors='coerce').fillna(0)
+                 predict_df[ohe_col] = predict_df[ohe_col].astype(int)
+             potential_ohe_col = f"Track_{track_type}"
+             if potential_ohe_col in expected_ohe_cols: logger.info(f"Setting OHE column '{potential_ohe_col}' to 1."); predict_df[potential_ohe_col] = 1
+             else:
+                 logger.warning(f"Constructed OHE column '{potential_ohe_col}' (for track '{track_type}') not found in expected features: {expected_ohe_cols}. Trying 'Track_Unknown'.")
+                 unknown_col = 'Track_Unknown';
+                 if unknown_col in expected_ohe_cols: logger.info(f"Setting OHE column '{unknown_col}' to 1."); predict_df[unknown_col] = 1
+                 else: logger.error(f"Cannot set OHE for current track '{track_type}', and '{unknown_col}' is also missing from expected features! Prediction may be inaccurate.")
+             if 'TrackType' in predict_df.columns: predict_df.drop(columns=['TrackType'], inplace=True, errors='ignore')
+        else: logger.info("TrackType feature (categorical or OHE) not found in model's expected features. Skipping.");
+        if 'TrackType' in predict_df.columns: predict_df.drop(columns=['TrackType'], inplace=True, errors='ignore')
+    except Exception as e: logger.error(f"Error handling track characteristic features: {e}", exc_info=True); return None, None, False
 
-
-            # Determine the specific OHE column for the current track
-            current_track_ohe_col = f"Track_{track_type.replace(' ', '_')}" # Construct expected column name
-            logger.info(f"Applying OHE for current track. Column: '{current_track_ohe_col}'")
-
-            if current_track_ohe_col in predict_df.columns:
-                # Set the specific column for this track to 1
-                predict_df[current_track_ohe_col] = 1
-            else:
-                # This should only happen if the track type is new and wasn't in feature_cols
-                logger.warning(f"OHE column '{current_track_ohe_col}' for current track not found in expected features. Track might be new or config/features mismatch.")
-                # Ensure Track_Unknown exists and set it if the specific column is missing
-                if 'Track_Unknown' in predict_df.columns:
-                    logger.warning("Setting 'Track_Unknown' to 1 as fallback.")
-                    predict_df['Track_Unknown'] = 1
-                else:
-                     logger.error("Cannot set OHE column for current track, and 'Track_Unknown' is also missing!")
-
-            # Remove the original 'TrackType' if it exists and we used OHE
-            if 'TrackType' in predict_df.columns:
-                predict_df.drop(columns=['TrackType'], inplace=True, errors='ignore')
-
-        else:
-            if 'TrackType' in feature_cols or any(f.startswith('Track_') for f in feature_cols):
-                 logger.warning("Track feature handling mismatch: Model expects track features but couldn't apply them.")
-            else:
-                 logger.info("TrackType feature not used by this model or not found in feature_cols.")
-
-    except Exception as e:
-        logger.error(f"Error handling categorical features: {e}", exc_info=True)
-        return None, None
-    # --- FIX END ---
-
-    # --- 7. Final Feature Selection and Validation ---
+    # --- 9. Final Validation and Feature Selection ---
+    logger.info("Performing final validation and column alignment...")
     final_missing_cols = [col for col in feature_cols if col not in predict_df.columns]
     if final_missing_cols:
-        logger.error(f"CRITICAL: Final features missing before selection: {final_missing_cols}. Available: {predict_df.columns.tolist()}")
-        for col in final_missing_cols: predict_df[col] = config.FILL_NA_VALUE
-        logger.warning(f"Added missing columns with value {config.FILL_NA_VALUE}.")
-
+        logger.error(f"CRITICAL: Features missing before final selection: {final_missing_cols}.")
+        # Attempt to add defaults
+        for col in final_missing_cols: fill_val = get_feature_fill_value(col); logger.warning(f"Adding missing column '{col}' with fill value: {fill_val}"); predict_df[col] = fill_val
+        final_missing_cols = [col for col in feature_cols if col not in predict_df.columns] # Re-check
+        if final_missing_cols: logger.error(f"CRITICAL: Still missing features after attempting to add defaults: {final_missing_cols}. Cannot proceed."); return None, None, False
+    logger.info("Ensuring correct data types based on training dtypes...")
+    for col, expected_dtype_str in feature_dtypes.items():
+        if col in predict_df.columns:
+            try:
+                current_dtype = predict_df[col].dtype; logger.debug(f"Checking column '{col}'. Expected: {expected_dtype_str}, Current: {current_dtype}")
+                if expected_dtype_str == 'category':
+                    if not pd.api.types.is_categorical_dtype(current_dtype): logger.debug(f"Casting column '{col}' to category."); predict_df[col] = predict_df[col].fillna('Unknown').astype('category')
+                elif expected_dtype_str.startswith('int') or expected_dtype_str.startswith('float'):
+                    target_numpy_type = np.int64 if expected_dtype_str.startswith('int') else np.float64
+                    if not np.issubdtype(current_dtype, np.number) or current_dtype != target_numpy_type:
+                        fill_val = get_feature_fill_value(col); logger.debug(f"Casting column '{col}' to {target_numpy_type} using fill: {fill_val}")
+                        numeric_series = pd.to_numeric(predict_df[col], errors='coerce')
+                        if numeric_series.isnull().any(): logger.warning(f"NaNs found in numeric column '{col}' before final cast. Filling with {fill_val}."); numeric_series.fillna(fill_val, inplace=True)
+                        predict_df[col] = numeric_series.astype(target_numpy_type)
+            except Exception as e: logger.error(f"Failed to cast column '{col}' to expected type '{expected_dtype_str}'. Error: {e}", exc_info=True); return None, None, False
+        else: logger.error(f"Column '{col}' required by model but not found during dtype check."); return None, None, False
+    if predict_df.columns.has_duplicates: logger.warning(f"Duplicate columns found before final selection: {predict_df.columns[predict_df.columns.duplicated()].tolist()}. Dropping duplicates."); predict_df = predict_df.loc[:, ~predict_df.columns.duplicated(keep='first')]
     try:
-        # Ensure no duplicate columns exist *before* selection
-        if predict_df.columns.has_duplicates:
-             logger.error(f"Duplicate columns found in predict_df BEFORE final selection: {predict_df.columns[predict_df.columns.duplicated()].tolist()}")
-             # Attempt to remove duplicates, keeping the first occurrence
-             predict_df = predict_df.loc[:, ~predict_df.columns.duplicated()]
-             logger.warning("Attempted to remove duplicate columns.")
-
-        # Now select the final features
+        missing_after_dedup = [col for col in feature_cols if col not in predict_df.columns]
+        if missing_after_dedup: logger.error(f"Features missing after duplicate removal: {missing_after_dedup}. Cannot proceed."); return None, None, False
         X_predict = predict_df[feature_cols].copy()
-        logger.info(f"Final feature set selected. Shape: {X_predict.shape}")
-    except KeyError as e:
-        logger.error(f"KeyError selecting final features: {e}. Expected: {feature_cols}. Available: {predict_df.columns.tolist()}"); return None, None
-    except Exception as e: # Catch other potential errors like duplicate labels during selection
-         logger.error(f"Error during final feature selection: {e}", exc_info=True); return None, None
-
-
-    try: # Final NaN/Inf check
-        numeric_cols_in_X = X_predict.select_dtypes(include=np.number).columns
-        if not numeric_cols_in_X.empty:
-            logger.debug(f"Final NaN/Inf check on numeric columns: {numeric_cols_in_X.tolist()}")
-            nan_mask = X_predict[numeric_cols_in_X].isnull()
-            if nan_mask.values.any():
-                logger.warning("NaNs detected in final numeric features! Filling.")
-                nan_cols_final = numeric_cols_in_X[nan_mask.any()].tolist(); logger.warning(f"NaNs in: {nan_cols_final}")
-                for col in nan_cols_final: X_predict[col].fillna(config.FILL_NA_VALUE, inplace=True)
-            inf_mask = np.isinf(X_predict[numeric_cols_in_X]).any().any()
-            if inf_mask:
-                logger.warning("Infs detected in final numeric features! Replacing.")
-                inf_cols_final = numeric_cols_in_X[np.isinf(X_predict[numeric_cols_in_X]).any()].tolist(); logger.warning(f"Infs in: {inf_cols_final}")
-                X_predict[numeric_cols_in_X] = X_predict[numeric_cols_in_X].replace([np.inf, -np.inf], config.FILL_NA_VALUE * 1000)
-        else: logger.debug("No numeric columns for final check.")
-    except Exception as e: logger.error(f"Error during final NaN/Inf check: {e}", exc_info=True)
+        logger.info(f"Final feature set selected and ordered. Shape: {X_predict.shape}")
+    except KeyError as e: logger.error(f"KeyError selecting final features: {e}. Model needs: {feature_cols}. Available: {predict_df.columns.tolist()}"); return None, None, False
+    except Exception as e: logger.error(f"Error during final feature selection/reordering: {e}", exc_info=True); return None, None, False
+    numeric_cols_in_X = X_predict.select_dtypes(include=np.number).columns
+    if not numeric_cols_in_X.empty:
+        nan_mask = X_predict[numeric_cols_in_X].isnull(); inf_mask = X_predict[numeric_cols_in_X].isin([np.inf, -np.inf])
+        if nan_mask.values.any(): nan_cols_final = numeric_cols_in_X[nan_mask.any()].tolist(); logger.warning(f"NaNs still detected in final numeric features: {nan_cols_final}. Filling."); [X_predict[col].fillna(get_feature_fill_value(col), inplace=True) for col in nan_cols_final]
+        if inf_mask.values.any(): inf_cols_final = numeric_cols_in_X[inf_mask.any()].tolist(); logger.warning(f"Infs detected in final numeric features: {inf_cols_final}. Replacing."); default_fill = get_feature_fill_value('default'); X_predict.replace([np.inf, -np.inf], default_fill * 100 if default_fill != 0 else -99999, inplace=True)
 
     logger.info(f"Prediction feature set prepared successfully.")
-    return X_predict, predict_info_df
+    # Return the prepared features (X), the info DF, and the fallback flag
+    # Cast GridPosition to int *here* after all filling is done
+    predict_df['GridPosition'] = predict_df['GridPosition'].astype(int)
+    final_info_df = predict_df[['Abbreviation', 'TeamName', 'GridPosition']].copy()
+
+    return X_predict, final_info_df, used_grid_fallback
 
 
 # --- make_predictions function ---
 def make_predictions(target_year, target_race_identifier):
-    """Orchestrates the prediction process."""
-    # (Keep this function as is - alignment logic is needed)
+    """Orchestrates the prediction process using cached features."""
     logger.info(f"--- Starting Prediction: {target_year} Race: {target_race_identifier} ---")
-    model = model_loader.load_model()
-    if model is None: logger.error("Prediction failed: Model not loaded."); return None
-    target_round, target_location, target_name = get_target_race_info(target_year, target_race_identifier)
-    if target_round is None: logger.error(f"Prediction failed: Target race '{target_race_identifier}' not identified for {target_year}."); return None
 
-    feature_cols = None
-    model_feature_path = os.path.join(config.MODEL_DIR, 'model_features.json')
-    if os.path.exists(model_feature_path):
-        try:
-            with open(model_feature_path, 'r') as f:
-                feature_cols = json.load(f)
-            logger.info(f"Loaded {len(feature_cols)} features from {model_feature_path}.")
-        except Exception as e:
-            logger.warning(f"Could not load features from {model_feature_path}: {e}. Will try inferring from model.")
-            feature_cols = None
+    model, feature_cols, feature_dtypes = model_loader.load_model_and_meta()
+    if model is None or feature_cols is None or feature_dtypes is None:
+        logger.error("Prediction failed: Model, features, or dtypes not loaded.")
+        return None
 
-    if feature_cols is None and hasattr(model, 'feature_names_in_'):
-        try:
-             feature_cols = model.feature_names_in_.tolist(); logger.info(f"Inferred {len(feature_cols)} features from model.")
-        except Exception as e: logger.warning(f"Could not get features from model: {e}. Falling back."); feature_cols = None
+    target_round, target_location, target_name, target_date = get_target_race_info(target_year, target_race_identifier)
+    if target_round is None:
+        logger.error(f"Prediction failed: Target race '{target_race_identifier}' not identified for {target_year}.")
+        return None
 
-    if feature_cols is None:
-        logger.warning("Falling back to feature_engineering for feature names.");
-        _, feature_cols_regen, _ = feature_engineering.create_features()
-        if not feature_cols_regen:
-            logger.error("Fallback feature_engineering failed. Cannot determine features.")
-            return None
-        feature_cols = feature_cols_regen
-        logger.info(f"Using {len(feature_cols)} features from feature_engineering fallback.")
+    # --- CHANGE: Capture the fallback flag ---
+    X_predict, predict_info_df, used_grid_fallback = prepare_prediction_data(
+        target_year, target_round, target_location, target_date, feature_cols, feature_dtypes
+    )
 
-    if not feature_cols:
-         logger.error("CRITICAL: Could not determine feature columns required for prediction.")
-         return None
-
-    logger.debug(f"Feature columns expected by model (or fallback): {feature_cols}")
-
-    X_predict, predict_info_df = prepare_prediction_data(target_year, target_round, target_location, feature_cols)
-    if X_predict is None or predict_info_df is None: logger.error("Prediction failed: Data preparation failed."); return None
-
-    # Ensure columns match EXACTLY (order matters)
-    try:
-        if list(X_predict.columns) != feature_cols:
-             logger.warning(f"Columns mismatch/reordering needed. Aligning prediction data to model's expected features: {feature_cols}")
-             # Check for duplicates *before* reindexing
-             if X_predict.columns.has_duplicates:
-                  logger.error(f"Duplicate columns found in X_predict BEFORE reindexing: {X_predict.columns[X_predict.columns.duplicated()].tolist()}")
-                  # Attempt removal again - this indicates an issue in prepare_prediction_data
-                  X_predict = X_predict.loc[:, ~X_predict.columns.duplicated()]
-                  logger.warning("Attempted duplicate column removal before reindexing.")
-
-             X_predict = X_predict.reindex(columns=feature_cols) # Reindex based on the definitive list
-             nan_check = X_predict.isnull().sum()
-             nan_cols = nan_check[nan_check > 0].index.tolist()
-             if nan_cols:
-                 logger.warning(f"NaNs introduced after reindexing columns: {nan_cols}. Filling with {config.FILL_NA_VALUE}.")
-                 X_predict.fillna(config.FILL_NA_VALUE, inplace=True)
-    except ValueError as e: # Catch duplicate label error during reindex
-         if "cannot reindex on an axis with duplicate labels" in str(e):
-              logger.error(f"Duplicate label error during reindex. X_predict columns: {list(X_predict.columns)}. Expected features: {feature_cols}", exc_info=True)
-         else:
-              logger.error(f"ValueError aligning columns: {e}", exc_info=True)
-         return None
-    except KeyError as e: logger.error(f"CRITICAL Column mismatch KeyError during reindex: {e}. Model needs {feature_cols}, Data has {list(X_predict.columns)}"); return None
-    except Exception as e: logger.error(f"Error aligning columns: {e}", exc_info=True); return None
+    # Check if prepare_prediction_data failed
+    if X_predict is None or predict_info_df is None:
+        logger.error("Prediction failed: Data preparation step failed.")
+        return None
+    if X_predict.empty or predict_info_df.empty:
+        logger.error("Prediction failed: Data preparation resulted in empty dataframes.")
+        return None
 
 
     logger.info(f"Making predictions for {len(X_predict)} drivers using {len(feature_cols)} features...")
     try:
-        predicted_positions_raw = model.predict(X_predict); logger.info("Raw predictions generated.")
-    except Exception as e: logger.error(f"Error during model.predict(): {e}", exc_info=True); return None
+        if hasattr(model, 'predict_proba'): logger.warning("Loaded model has predict_proba, might be a classifier. Attempting predict anyway.")
+        predicted_positions_raw = model.predict(X_predict)
+        logger.info("Raw predictions generated.")
+        if not pd.api.types.is_numeric_dtype(predicted_positions_raw): logger.warning("Model predictions are not numeric. Attempting conversion."); predicted_positions_raw = pd.to_numeric(predicted_positions_raw, errors='coerce')
+        if np.isnan(predicted_positions_raw).any(): nan_count = np.isnan(predicted_positions_raw).sum(); logger.error(f"Model produced {nan_count} NaN predictions!"); predicted_positions_raw = np.nan_to_num(predicted_positions_raw, nan=999.0) # Rank NaNs last
 
-    try: # Format Results
-        predict_info_df['PredictedPosition_Raw'] = predicted_positions_raw
-        predict_info_df.sort_values(by='PredictedPosition_Raw', inplace=True, ascending=True, kind='stable')
-        predict_info_df['PredictedRank'] = range(1, len(predict_info_df) + 1)
+    except Exception as e:
+        logger.error(f"Error during model.predict(): {e}", exc_info=True)
+        logger.error(f"Prediction data (X_predict) info:\n{X_predict.info()}")
+        problematic_cols = X_predict.columns[X_predict.isnull().any()].tolist()
+        logger.error(f"X_predict head (check for NaNs/Infs, especially in {problematic_cols}):\n{X_predict.head()}")
+        return None
+
+    # --- Process and Format Results ---
+    try:
+        results_df = predict_info_df.copy()
+        if len(results_df) != len(predicted_positions_raw): logger.error(f"Mismatch between info rows ({len(results_df)}) and predictions ({len(predicted_positions_raw)}). Cannot create results."); return None
+        results_df['PredictedPosition_Raw'] = predicted_positions_raw
+        results_df.sort_values(by='PredictedPosition_Raw', inplace=True, ascending=True, kind='stable', na_position='last')
+        results_df['PredictedRank'] = range(1, len(results_df) + 1)
         logger.info("Prediction results processed and ranked.")
+
+        # --- CHANGE: Add warning if fallback grid was used ---
+        if used_grid_fallback:
+            logger.warning("NOTE: Predictions below are based on FALLBACK Grid Positions (Qualifying data was missing). Accuracy may be reduced.")
+            print("\n *** WARNING: Using fallback Grid Positions (Qualifying data missing) ***\n")
+        # --- CHANGE END ---
+
         display_cols = ['PredictedRank', 'Abbreviation', 'TeamName', 'GridPosition', 'PredictedPosition_Raw']
-        final_display_cols = [col for col in display_cols if col in predict_info_df.columns]
-        final_predictions = predict_info_df[final_display_cols].copy()
-        if 'GridPosition' in final_predictions.columns:
-             final_predictions['GridPosition'].fillna('N/A', inplace=True)
+        final_display_cols = [col for col in display_cols if col in results_df.columns]
+        final_predictions = results_df[final_display_cols].copy()
+
+        # Final formatting for display
+        if 'GridPosition' in final_predictions.columns: final_predictions['GridPosition'] = final_predictions['GridPosition'].astype(str)
+        if 'PredictedPosition_Raw' in final_predictions.columns: final_predictions['PredictedPosition_Raw'] = final_predictions['PredictedPosition_Raw'].round(2)
+        if 'PredictedRank' in final_predictions.columns: final_predictions['PredictedRank'] = final_predictions['PredictedRank'].astype(int)
+
         return final_predictions
-    except Exception as e: logger.error(f"Error formatting results: {e}", exc_info=True); return None
+    except Exception as e:
+        logger.error(f"Error formatting results: {e}", exc_info=True)
+        return None
